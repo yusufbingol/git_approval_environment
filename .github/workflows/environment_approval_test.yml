@@ -10,8 +10,10 @@ jobs:
       - run: echo "Pre-check completed"
 
   approval_gate:
+    name: "⚠️ Production deploy: X değişikliğini onaylıyorsun"
     needs: pre_check
     runs-on: ubuntu-latest
     environment: approval-test
+
     steps:
       - run: echo "Approval received, continuing workflow"
