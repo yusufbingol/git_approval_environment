@@ -1,0 +1,17 @@
+name: Environment Approval Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pre_check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Pre-check completed"
+
+  approval_gate:
+    needs: pre_check
+    runs-on: ubuntu-latest
+    environment: approval-test
+    steps:
+      - run: echo "Approval received, continuing workflow"
