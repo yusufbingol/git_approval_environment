@@ -1,0 +1,319 @@
+# SDK Build Trigger (GitHub Actions -> Bitrise)
+#
+# Parallel-period replacement for ci/jenkins/sdk_pipeline.groovy (Jenkins stays
+# active during the migration). This workflow does NO building: it validates
+# parameters and triggers the Bitrise `sdk_build` workflow via the Build
+# Trigger API, exactly like Jenkins does. Fire-and-forget: no Bitrise polling.
+# Manual runs only (no schedule), mirroring the Jenkins SDK pipeline.
+#
+# Branch selection: the branch this workflow is run from (github.ref_name) is
+# sent to Bitrise as CURRENT_BRANCH. There is no separate branch input.
+#
+# Required repo secrets: BITRISE_BUILD_TRIGGER_TOKEN, BITRISE_APP_SLUG
+# Required GitHub Environments (with required reviewers):
+#   - sdk-publish: approval gate for PUBLISH=true runs (replaces the Jenkins
+#     publish confirmation prompt).
+#   - version-mismatch-confirmation: approval gate when update_version=true
+#     and a vX.Y.Z branch does not match VERSION_NAME.
+#
+# Env mapping to Bitrise (identical to Jenkins):
+#   - CURRENT_BRANCH: always
+#   - publish=true  -> PUBLISH=true + JFROG_PROJECT (astint if internal_only,
+#     else assistbox) + INTERNAL_VERSION_SUFFIX (only when internal_only)
+#   - update_version=true -> VERSION_NAME + VERSION_CODE
+#   - INTERNAL_ONLY and UPDATE_VERSION themselves are NOT sent to Bitrise.
+#
+# See .github/workflows/README.md for full setup instructions.
+
+name: SDK Build Trigger
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish SDK artifacts (requires reviewer approval via the sdk-publish environment)'
+        required: false
+        type: boolean
+        default: false
+      update_version:
+        description: 'Update VERSION_NAME and VERSION_CODE before build'
+        required: false
+        type: boolean
+        default: false
+      version_name:
+        description: 'Version Name in VERSION_NUMBER-BUILD_NUMBER format (required when update_version is checked)'
+        required: false
+        type: string
+        default: ''
+      version_code:
+        description: 'Version Code (required when update_version is checked)'
+        required: false
+        type: string
+        default: ''
+      internal_only:
+        description: 'Publish to the internal JFrog project (astint) only — rehearsal/RC builds, never customer-facing. Requires publish.'
+        required: false
+        type: boolean
+        default: false
+      internal_version_suffix:
+        description: 'Prerelease suffix for internal publishes, e.g. rc.1 -> X.Y.Z-rc.1. REQUIRED when internal_only.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate parameters
+    runs-on: ubuntu-latest
+    outputs:
+      version_name: ${{ steps.resolve.outputs.version_name }}
+      version_code: ${{ steps.resolve.outputs.version_code }}
+      internal_version_suffix: ${{ steps.resolve.outputs.internal_version_suffix }}
+      jfrog_project: ${{ steps.resolve.outputs.jfrog_project }}
+      needs_mismatch_approval: ${{ steps.resolve.outputs.needs_mismatch_approval }}
+    steps:
+      - name: Resolve and validate parameters
+        id: resolve
+        env:
+          CURRENT_BRANCH: ${{ github.ref_name }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          INPUT_UPDATE_VERSION: ${{ inputs.update_version }}
+          INPUT_VERSION_NAME: ${{ inputs.version_name }}
+          INPUT_VERSION_CODE: ${{ inputs.version_code }}
+          INPUT_INTERNAL_ONLY: ${{ inputs.internal_only }}
+          INPUT_INTERNAL_VERSION_SUFFIX: ${{ inputs.internal_version_suffix }}
+        run: |
+          set -euo pipefail
+
+          version_name="$(printf '%s' "$INPUT_VERSION_NAME" | tr -d '[:space:]')"
+          version_code="$(printf '%s' "$INPUT_VERSION_CODE" | tr -d '[:space:]')"
+          internal_suffix="$(printf '%s' "$INPUT_INTERNAL_VERSION_SUFFIX" | tr -d '[:space:]')"
+
+          errors=()
+
+          # Mirrors ci/jenkins/sdk_pipeline.groovy validations exactly.
+          if [ "$INPUT_UPDATE_VERSION" = "true" ]; then
+            if [ -z "$version_name" ]; then
+              errors+=("VERSION_NAME is required when UPDATE_VERSION is enabled")
+            elif ! printf '%s' "$version_name" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$'; then
+              errors+=("VERSION_NAME must be in VERSION_NUMBER-BUILD_NUMBER format (example: 19.0.0-1)")
+            fi
+
+            if [ -z "$version_code" ]; then
+              errors+=("VERSION_CODE is required when UPDATE_VERSION is enabled")
+            elif ! printf '%s' "$version_code" | grep -Eq '^[0-9]+$'; then
+              errors+=("VERSION_CODE must be an integer when UPDATE_VERSION is enabled")
+            fi
+          fi
+
+          # Internal-only publish mode (AS-21701): a rehearsal/RC publish into
+          # the astint JFrog project. It is a mode of PUBLISH, not a standalone action.
+          if [ "$INPUT_INTERNAL_ONLY" = "true" ] && [ "$INPUT_PUBLISH" != "true" ]; then
+            errors+=("INTERNAL_ONLY requires PUBLISH to be enabled (it is a publish mode, not a separate action)")
+          fi
+
+          # Android deviation from iOS: the suffix is REQUIRED for internal
+          # publishes — an internal X.Y.Z must never collide with the released X.Y.Z.
+          if [ "$INPUT_INTERNAL_ONLY" = "true" ] && [ -z "$internal_suffix" ]; then
+            errors+=("INTERNAL_VERSION_SUFFIX is required when INTERNAL_ONLY is enabled (an internal X.Y.Z must never collide with the released X.Y.Z)")
+          fi
+
+          if [ -n "$internal_suffix" ] && [ "$INPUT_INTERNAL_ONLY" != "true" ]; then
+            errors+=("INTERNAL_VERSION_SUFFIX is only allowed when INTERNAL_ONLY is enabled")
+          fi
+
+          # The leading character class also rejects a leading dash.
+          if [ -n "$internal_suffix" ] && ! printf '%s' "$internal_suffix" | grep -Eq '^[0-9A-Za-z][0-9A-Za-z.-]*$'; then
+            errors+=("INTERNAL_VERSION_SUFFIX must be a valid prerelease suffix (dot-separated alphanumerics/hyphens, e.g. rc.1) with no leading dash")
+          fi
+
+          if [ "${#errors[@]}" -gt 0 ]; then
+            echo "Required parameters are missing or invalid:" >&2
+            printf ' - %s\n' "${errors[@]}" >&2
+            exit 1
+          fi
+
+          # vX.Y.Z branch vs VERSION_NAME version-part mismatch check (only
+          # when UPDATE_VERSION is enabled, since VERSION_NAME is not forwarded
+          # otherwise). Routes through the version-mismatch-confirmation
+          # environment instead of hard-failing (matches the Jenkins prompt).
+          needs_mismatch_approval=false
+          if [ "$INPUT_UPDATE_VERSION" = "true" ] && [ -n "$version_name" ] \
+            && printf '%s' "$CURRENT_BRANCH" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            branch_version="${CURRENT_BRANCH#v}"
+            name_version="${version_name%-*}"
+            if [ "$branch_version" != "$name_version" ]; then
+              echo "Branch version (${branch_version}) does not match VERSION_NAME version part (${name_version})."
+              echo "Manual confirmation required via the 'version-mismatch-confirmation' environment."
+              needs_mismatch_approval=true
+            fi
+          fi
+
+          jfrog_project=""
+          if [ "$INPUT_PUBLISH" = "true" ]; then
+            if [ "$INPUT_INTERNAL_ONLY" = "true" ]; then
+              jfrog_project="astint"
+            else
+              jfrog_project="assistbox"
+            fi
+          fi
+
+          echo "Build will be triggered with: CURRENT_BRANCH=${CURRENT_BRANCH}, PUBLISH=${INPUT_PUBLISH}, UPDATE_VERSION=${INPUT_UPDATE_VERSION}, INTERNAL_ONLY=${INPUT_INTERNAL_ONLY}, JFROG_PROJECT=${jfrog_project:-<none>}"
+          {
+            echo "version_name=${version_name}"
+            echo "version_code=${version_code}"
+            echo "internal_version_suffix=${internal_suffix}"
+            echo "jfrog_project=${jfrog_project}"
+            echo "needs_mismatch_approval=${needs_mismatch_approval}"
+          } >> "$GITHUB_OUTPUT"
+
+  approve_publish:
+    name: Approve SDK publish
+    runs-on: ubuntu-latest
+    needs: validate
+    if: inputs.publish
+    # Requires the 'sdk-publish' GitHub Environment with required reviewers
+    # (approval == the Jenkins PUBLISH confirmation prompt).
+    environment: sdk-publish
+    steps:
+      - name: Publish approved by reviewer
+        env:
+          INTERNAL_ONLY: ${{ inputs.internal_only }}
+          JFROG_PROJECT: ${{ needs.validate.outputs.jfrog_project }}
+        run: |
+          set -euo pipefail
+          if [ "$INTERNAL_ONLY" = "true" ]; then
+            echo "Reviewer approved: PUBLISH + INTERNAL_ONLY — SDK artifacts will be published to the internal JFrog project (astint) only, not customer-facing."
+          else
+            echo "Reviewer approved: PUBLISH — SDK artifacts will be published (JFROG_PROJECT=${JFROG_PROJECT})."
+          fi
+
+  confirm_version_mismatch:
+    name: Confirm branch/version mismatch
+    runs-on: ubuntu-latest
+    needs: validate
+    if: needs.validate.outputs.needs_mismatch_approval == 'true'
+    # Requires the 'version-mismatch-confirmation' GitHub Environment with
+    # required reviewers (approval == Jenkins "Yes, Continue" input step).
+    environment: version-mismatch-confirmation
+    steps:
+      - name: Mismatch confirmed by reviewer
+        env:
+          CURRENT_BRANCH: ${{ github.ref_name }}
+          VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+        run: |
+          set -euo pipefail
+          echo "Reviewer approved: branch '${CURRENT_BRANCH}' does not match VERSION_NAME '${VERSION_NAME}' version part. Continuing."
+
+  trigger:
+    name: Trigger Bitrise sdk_build
+    runs-on: ubuntu-latest
+    needs: [validate, approve_publish, confirm_version_mismatch]
+    if: >-
+      always() &&
+      needs.validate.result == 'success' &&
+      (inputs.publish != true || needs.approve_publish.result == 'success') &&
+      (needs.validate.outputs.needs_mismatch_approval != 'true' || needs.confirm_version_mismatch.result == 'success')
+    steps:
+      - name: Trigger Bitrise build (fire-and-forget)
+        env:
+          BITRISE_BUILD_TRIGGER_TOKEN: ${{ secrets.BITRISE_BUILD_TRIGGER_TOKEN }}
+          BITRISE_APP_SLUG: ${{ secrets.BITRISE_APP_SLUG }}
+          CURRENT_BRANCH: ${{ github.ref_name }}
+          PUBLISH: ${{ inputs.publish }}
+          UPDATE_VERSION: ${{ inputs.update_version }}
+          INTERNAL_ONLY: ${{ inputs.internal_only }}
+          VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+          VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+          INTERNAL_VERSION_SUFFIX: ${{ needs.validate.outputs.internal_version_suffix }}
+          JFROG_PROJECT: ${{ needs.validate.outputs.jfrog_project }}
+        run: |
+          set -euo pipefail
+          # Never enable xtrace here: the payload contains the trigger token.
+
+          if [ -z "${BITRISE_BUILD_TRIGGER_TOKEN:-}" ] || [ -z "${BITRISE_APP_SLUG:-}" ]; then
+            echo "Missing required secrets: BITRISE_BUILD_TRIGGER_TOKEN and/or BITRISE_APP_SLUG." >&2
+            exit 1
+          fi
+
+          # Environments: CURRENT_BRANCH always; PUBLISH/JFROG_PROJECT (+ suffix
+          # when internal-only) on publish; VERSION_NAME/VERSION_CODE on
+          # update_version. INTERNAL_ONLY/UPDATE_VERSION are NOT sent (Jenkins parity).
+          environments='[]'
+          add_env() {
+            environments="$(printf '%s' "$environments" | jq \
+              --arg key "$1" --arg value "$2" \
+              '. + [{mapped_to: $key, value: $value, is_expand: true}]')"
+          }
+
+          add_env "CURRENT_BRANCH" "$CURRENT_BRANCH"
+
+          if [ "$PUBLISH" = "true" ]; then
+            add_env "PUBLISH" "true"
+            add_env "JFROG_PROJECT" "$JFROG_PROJECT"
+            if [ "$INTERNAL_ONLY" = "true" ] && [ -n "$INTERNAL_VERSION_SUFFIX" ]; then
+              add_env "INTERNAL_VERSION_SUFFIX" "$INTERNAL_VERSION_SUFFIX"
+            fi
+          fi
+
+          if [ "$UPDATE_VERSION" = "true" ]; then
+            if [ -n "$VERSION_NAME" ]; then
+              add_env "VERSION_NAME" "$VERSION_NAME"
+            fi
+            if [ -n "$VERSION_CODE" ]; then
+              add_env "VERSION_CODE" "$VERSION_CODE"
+            fi
+          fi
+
+          payload="$(jq -n \
+            --arg token "$BITRISE_BUILD_TRIGGER_TOKEN" \
+            --arg branch "$CURRENT_BRANCH" \
+            --argjson environments "$environments" \
+            '{
+              hook_info: {type: "bitrise", build_trigger_token: $token},
+              build_params: {
+                branch: $branch,
+                workflow_id: "sdk_build",
+                environments: $environments
+              },
+              triggered_by: "github-actions"
+            }')"
+
+          response="$(curl "https://app.bitrise.io/app/${BITRISE_APP_SLUG}/build/start.json" \
+            --silent --show-error --fail \
+            --data "$payload")"
+
+          status="$(printf '%s' "$response" | jq -r '.status // empty' | tr '[:upper:]' '[:lower:]')"
+          build_slug="$(printf '%s' "$response" | jq -r '.build_slug // empty')"
+
+          if [ "$status" != "ok" ]; then
+            echo "Bitrise trigger failed. Unexpected response status: '${status}'. Full response:" >&2
+            printf '%s\n' "$response" >&2
+            exit 1
+          fi
+
+          build_url="https://app.bitrise.io/build/${build_slug}"
+          echo "Bitrise build triggered successfully. Build slug: ${build_slug:-N/A}"
+          {
+            echo "## Bitrise sdk_build triggered"
+            echo ""
+            echo "- Branch: \`${CURRENT_BRANCH}\`"
+            echo "- PUBLISH: \`${PUBLISH}\`"
+            echo "- UPDATE_VERSION: \`${UPDATE_VERSION}\`"
+            if [ "$PUBLISH" = "true" ]; then
+              echo "- JFROG_PROJECT: \`${JFROG_PROJECT}\`"
+            fi
+            if [ "$INTERNAL_ONLY" = "true" ]; then
+              echo "- INTERNAL_VERSION_SUFFIX: \`${INTERNAL_VERSION_SUFFIX}\`"
+            fi
+            if [ "$UPDATE_VERSION" = "true" ]; then
+              echo "- VERSION_NAME: \`${VERSION_NAME}\`"
+              echo "- VERSION_CODE: \`${VERSION_CODE}\`"
+            fi
+            echo "- Build: ${build_url}"
+            echo ""
+            echo "_Fire-and-forget: build status is tracked on Bitrise, not here._"
+          } >> "$GITHUB_STEP_SUMMARY"
