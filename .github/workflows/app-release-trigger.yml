@@ -127,8 +127,8 @@ jobs:
           set -euo pipefail
           next_code=$((CURRENT_CODE + 1))
           version_part="${CURRENT_NAME%-*}"
-          build_number="${CURRENT_NAME##*-}"
           next_name="${version_part}-$((build_number + 1))"
+          build_number="${CURRENT_NAME##*-}"
 
           echo "Computed next versions: VERSION_CODE=${next_code}, VERSION_NAME=${next_name} (from ${CURRENT_CODE} / ${CURRENT_NAME})"
           echo "version_code=${next_code}" >> "$GITHUB_OUTPUT"
@@ -228,6 +228,7 @@ jobs:
           CURRENT_CODE: ${{ steps.current.outputs.current_code }}
           NEW_NAME: ${{ steps.resolve.outputs.version_name }}
           NEW_CODE: ${{ steps.resolve.outputs.version_code }}
+          PERIODIC_ENABLED: ${{ vars.ANDROID_PERIODIC_BUILD_ENABLED }}
         run: |
           set -euo pipefail
 
@@ -258,10 +259,16 @@ jobs:
           # Shown to the reviewer BEFORE approval (GitHub's "Review deployments"
           # modal is not customizable, so the comparison lives here and in the
           # approve_version_update job name).
+          if [ "${PERIODIC_ENABLED:-}" = "true" ]; then
+            periodic_note="🟢 Periodic (scheduled) build is currently ENABLED (\`ANDROID_PERIODIC_BUILD_ENABLED=true\`) — the nightly schedule will keep auto-incrementing versions from gradle.properties."
+          else
+            periodic_note="⚪ Periodic (scheduled) build is currently DISABLED (\`ANDROID_PERIODIC_BUILD_ENABLED\` is not \`true\`) — scheduled runs are no-ops; only manual releases trigger builds."
+          fi
           {
             echo "## ⚠️ Version Update Approval Pending"
             echo ""
             echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo "- ${periodic_note}"
             echo ""
             echo "| | VERSION_NAME | VERSION_CODE |"
             echo "|---|---|---|"
