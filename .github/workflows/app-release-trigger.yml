@@ -40,7 +40,7 @@ on:
     # itself (not recorded in this repo). Daily 03:00 UTC is a placeholder —
     # align it with the actual Jenkins cron before enabling
     # ANDROID_PERIODIC_BUILD_ENABLED.
-    - cron: '45 16 * * *'
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
