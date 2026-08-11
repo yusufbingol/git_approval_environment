@@ -89,21 +89,29 @@ jobs:
         if: steps.schedule_guard.outputs.skip != 'true'
         run: |
           set -euo pipefail
+
           # Version source of truth: root gradle.properties
           # (assistbox.versionName / assistbox.versionCode — same keys Fastlane
-          # VersionHelper reads and rewrites).
+          # VersionHelper reads and rewrites). Scheduled runs use these values
+          # to compute the next versions; manual runs use them for the
+          # version-update approval comparison and guards.
           current_name="$(sed -n 's/^assistbox\.versionName=//p' gradle.properties | tr -d '[:space:]')"
           current_code="$(sed -n 's/^assistbox\.versionCode=//p' gradle.properties | tr -d '[:space:]')"
 
           if ! printf '%s' "$current_code" | grep -Eq '^[0-9]+$'; then
-            echo "assistbox.versionCode in gradle.properties must be an integer. Found: '$current_code'" >&2
+            msg="assistbox.versionCode in gradle.properties must be an integer. Found: '${current_code}' (branch: ${GITHUB_REF_NAME})"
+            echo "::error title=Invalid gradle.properties::${msg}"
+            printf '## ❌ Invalid gradle.properties\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           if ! printf '%s' "$current_name" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$'; then
-            echo "assistbox.versionName in gradle.properties must be in VERSION_NUMBER-BUILD_NUMBER format. Found: '$current_name'" >&2
+            msg="assistbox.versionName in gradle.properties must be in VERSION_NUMBER-BUILD_NUMBER format (example: 19.0.0-1). Found: '${current_name}' (branch: ${GITHUB_REF_NAME})"
+            echo "::error title=Invalid gradle.properties::${msg}"
+            printf '## ❌ Invalid gradle.properties\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
+          echo "Current versions: VERSION_NAME=${current_name}, VERSION_CODE=${current_code}"
           {
             echo "current_name=${current_name}"
             echo "current_code=${current_code}"
@@ -161,8 +169,14 @@ jobs:
           fi
 
           if [ "${#errors[@]}" -gt 0 ]; then
-            echo "Required parameters are missing or invalid:" >&2
-            printf ' - %s\n' "${errors[@]}" >&2
+            {
+              echo "## ❌ Invalid parameters"
+              echo ""
+              printf -- '- %s\n' "${errors[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            for err in "${errors[@]}"; do
+              echo "::error title=Invalid parameters::${err}"
+            done
             exit 1
           fi
 
@@ -176,7 +190,9 @@ jobs:
             name_version="${version_name%-*}"
             if [ "$branch_version" != "$name_version" ]; then
               if [ "$EVENT_NAME" = "schedule" ]; then
-                echo "ABORTED: Branch version (${branch_version}) does not match VERSION_NAME version part (${name_version}) on a scheduled run." >&2
+                msg="Scheduled run aborted: branch version (${branch_version}) does not match VERSION_NAME version part (${name_version}). Scheduled runs never continue on a risky condition."
+                echo "::error title=Branch/version mismatch::${msg}"
+                printf '## ❌ Branch/version mismatch (scheduled run aborted)\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
                 exit 1
               fi
               echo "Branch version (${branch_version}) does not match VERSION_NAME version part (${name_version})."
@@ -213,8 +229,18 @@ jobs:
             errors+=("New VERSION_CODE '${NEW_CODE}' must be greater than the current VERSION_CODE '${CURRENT_CODE}'")
           fi
           if [ "${#errors[@]}" -gt 0 ]; then
-            echo "Version update inputs are invalid:" >&2
-            printf ' - %s\n' "${errors[@]}" >&2
+            {
+              echo "## ❌ Invalid version update"
+              echo ""
+              echo "- Branch: \`${GITHUB_REF_NAME}\`"
+              echo "- Current version (gradle.properties): \`${CURRENT_NAME}\` (\`${CURRENT_CODE}\`)"
+              echo "- Requested version: \`${NEW_NAME}\` (\`${NEW_CODE}\`)"
+              echo ""
+              printf -- '- ❌ %s\n' "${errors[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            for err in "${errors[@]}"; do
+              echo "::error title=Invalid version update::${err}"
+            done
             exit 1
           fi
 
@@ -298,7 +324,9 @@ jobs:
           # Never enable xtrace here: the payload contains the trigger token.
 
           if [ -z "${BITRISE_BUILD_TRIGGER_TOKEN:-}" ] || [ -z "${BITRISE_APP_SLUG:-}" ]; then
-            echo "Missing required secrets: BITRISE_BUILD_TRIGGER_TOKEN and/or BITRISE_APP_SLUG." >&2
+            msg="Missing required repo secrets: BITRISE_BUILD_TRIGGER_TOKEN and/or BITRISE_APP_SLUG (Settings -> Secrets and variables -> Actions)."
+            echo "::error title=Missing secrets::${msg}"
+            printf '## ❌ Missing secrets\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
@@ -329,7 +357,10 @@ jobs:
           build_slug="$(printf '%s' "$response" | jq -r '.build_slug // empty')"
 
           if [ "$status" != "ok" ]; then
-            echo "Bitrise trigger failed. Unexpected response status: '${status}'. Full response:" >&2
+            msg="Bitrise trigger failed for app_release. Unexpected response status: '${status:-<empty>}'. See the step log for the full response."
+            echo "::error title=Bitrise trigger failed::${msg}"
+            printf '## ❌ Bitrise trigger failed\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
+            echo "Full Bitrise response:" >&2
             printf '%s\n' "$response" >&2
             exit 1
           fi

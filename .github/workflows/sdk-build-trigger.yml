@@ -15,10 +15,9 @@
 #     publish confirmation prompt).
 #   - version-mismatch-confirmation: approval gate when update_version=true
 #     and a vX.Y.Z branch does not match VERSION_NAME.
-#   - version-update-approval: approval gate when update_version=true. The
-#     gated job's name shows "Current X (code) -> New Y (code)" (read from
-#     gradle.properties on the branch) so the reviewer confirms the exact
-#     version change; a comparison table is also written to the run summary.
+#   - version-update-approval: approval gate for every update_version=true run;
+#     the reviewer sees "Current X -> New Y" in the job name and the run
+#     summary before approving the version update.
 #
 # Env mapping to Bitrise (identical to Jenkins):
 #   - CURRENT_BRANCH: always
@@ -141,8 +140,14 @@ jobs:
           fi
 
           if [ "${#errors[@]}" -gt 0 ]; then
-            echo "Required parameters are missing or invalid:" >&2
-            printf ' - %s\n' "${errors[@]}" >&2
+            {
+              echo "## ❌ Invalid parameters"
+              echo ""
+              printf -- '- %s\n' "${errors[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            for err in "${errors[@]}"; do
+              echo "::error title=Invalid parameters::${err}"
+            done
             exit 1
           fi
 
@@ -180,7 +185,7 @@ jobs:
             echo "needs_mismatch_approval=${needs_mismatch_approval}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Read current version and compare
+      - name: Read current version and prepare approval summary
         id: current
         if: inputs.update_version
         env:
@@ -188,28 +193,41 @@ jobs:
           NEW_CODE: ${{ steps.resolve.outputs.version_code }}
         run: |
           set -euo pipefail
+
+          # Version source of truth: root gradle.properties
+          # (assistbox.versionName / assistbox.versionCode — same keys Fastlane
+          # VersionHelper reads and rewrites).
           current_name="$(sed -n 's/^assistbox\.versionName=//p' gradle.properties | tr -d '[:space:]')"
           current_code="$(sed -n 's/^assistbox\.versionCode=//p' gradle.properties | tr -d '[:space:]')"
+
           if [ -z "$current_name" ] || [ -z "$current_code" ]; then
-            echo "assistbox.versionName/assistbox.versionCode not found in gradle.properties on this branch." >&2
-            exit 1
-          fi
-          if ! printf '%s' "$current_code" | grep -Eq '^[0-9]+$'; then
-            echo "assistbox.versionCode in gradle.properties must be an integer. Found: '${current_code}'" >&2
+            msg="Could not read assistbox.versionName and/or assistbox.versionCode from gradle.properties on branch '${GITHUB_REF_NAME}'."
+            echo "::error title=Invalid gradle.properties::${msg}"
+            printf '## ❌ Invalid gradle.properties\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
-          # Guard against non-increasing values (wrong-input protection).
+          # Guard against mistyped inputs before asking a reviewer to approve.
           errors=()
           if [ "$NEW_NAME" = "$current_name" ]; then
-            errors+=("version_name (${NEW_NAME}) is the same as the current version")
+            errors+=("New VERSION_NAME '${NEW_NAME}' is identical to the current version in gradle.properties — nothing to update")
           fi
           if [ "$NEW_CODE" -le "$current_code" ]; then
-            errors+=("version_code (${NEW_CODE}) must be greater than the current code (${current_code})")
+            errors+=("New VERSION_CODE '${NEW_CODE}' must be greater than the current VERSION_CODE '${current_code}'")
           fi
           if [ "${#errors[@]}" -gt 0 ]; then
-            echo "Invalid version input:" >&2
-            printf ' - %s\n' "${errors[@]}" >&2
+            {
+              echo "## ❌ Invalid version update"
+              echo ""
+              echo "- Branch: \`${GITHUB_REF_NAME}\`"
+              echo "- Current version (gradle.properties): \`${current_name}\` (\`${current_code}\`)"
+              echo "- Requested version: \`${NEW_NAME}\` (\`${NEW_CODE}\`)"
+              echo ""
+              printf -- '- ❌ %s\n' "${errors[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            for err in "${errors[@]}"; do
+              echo "::error title=Invalid version update::${err}"
+            done
             exit 1
           fi
 
@@ -218,26 +236,31 @@ jobs:
             echo "current_code=${current_code}"
           } >> "$GITHUB_OUTPUT"
 
+          # Shown to the reviewer BEFORE approval (GitHub's "Review deployments"
+          # modal is not customizable, so the comparison lives here and in the
+          # approve_version_update job name).
           {
-            echo "## ⚠️ Versiyon Güncelleme Onayı Bekleniyor"
+            echo "## ⚠️ Version Update Approval Pending"
             echo ""
             echo "- Branch: \`${GITHUB_REF_NAME}\`"
             echo ""
-            echo "|        | VERSION_NAME | VERSION_CODE |"
-            echo "|--------|--------------|--------------|"
-            echo "| Mevcut | \`${current_name}\` | \`${current_code}\` |"
-            echo "| Yeni   | \`${NEW_NAME}\` | \`${NEW_CODE}\` |"
+            echo "| | VERSION_NAME | VERSION_CODE |"
+            echo "|---|---|---|"
+            echo "| Current | \`${current_name}\` | \`${current_code}\` |"
+            echo "| New | \`${NEW_NAME}\` | \`${NEW_CODE}\` |"
             echo ""
-            echo "Onaylamak için bekleyen deployment'ı **Review deployments** ile onaylayın."
+            echo "_Approve via Review deployments._"
           } >> "$GITHUB_STEP_SUMMARY"
 
   approve_version_update:
-    name: "⚠️ [${{ github.ref_name }}] Current ${{ needs.validate.outputs.current_version_name }} (${{ needs.validate.outputs.current_version_code }}) -> New ${{ needs.validate.outputs.version_name }} (${{ needs.validate.outputs.version_code }}) onaylıyor musunuz?"
+    name: "⚠️ [${{ github.ref_name }}] Approve version update: Current ${{ needs.validate.outputs.current_version_name }} (${{ needs.validate.outputs.current_version_code }}) -> New ${{ needs.validate.outputs.version_name }} (${{ needs.validate.outputs.version_code }})?"
     runs-on: ubuntu-latest
     needs: validate
     if: inputs.update_version
     # Requires the 'version-update-approval' GitHub Environment with required
-    # reviewers. The job name shows the exact current -> new version change.
+    # reviewers. The current -> new comparison is surfaced in the job name and
+    # the validate job's step summary (the approval modal itself cannot be
+    # customized).
     environment: version-update-approval
     steps:
       - name: Version update approved by reviewer
@@ -291,12 +314,12 @@ jobs:
   trigger:
     name: Trigger Bitrise sdk_build
     runs-on: ubuntu-latest
-    needs: [validate, approve_version_update, approve_publish, confirm_version_mismatch]
+    needs: [validate, approve_publish, confirm_version_mismatch, approve_version_update]
     if: >-
       always() &&
       needs.validate.result == 'success' &&
-      (inputs.update_version != true || needs.approve_version_update.result == 'success') &&
       (inputs.publish != true || needs.approve_publish.result == 'success') &&
+      (inputs.update_version != true || needs.approve_version_update.result == 'success') &&
       (needs.validate.outputs.needs_mismatch_approval != 'true' || needs.confirm_version_mismatch.result == 'success')
     steps:
       - name: Trigger Bitrise build (fire-and-forget)
@@ -316,7 +339,9 @@ jobs:
           # Never enable xtrace here: the payload contains the trigger token.
 
           if [ -z "${BITRISE_BUILD_TRIGGER_TOKEN:-}" ] || [ -z "${BITRISE_APP_SLUG:-}" ]; then
-            echo "Missing required secrets: BITRISE_BUILD_TRIGGER_TOKEN and/or BITRISE_APP_SLUG." >&2
+            msg="Missing required repo secrets: BITRISE_BUILD_TRIGGER_TOKEN and/or BITRISE_APP_SLUG (Settings -> Secrets and variables -> Actions)."
+            echo "::error title=Missing secrets::${msg}"
+            printf '## ❌ Missing secrets\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
@@ -371,7 +396,10 @@ jobs:
           build_slug="$(printf '%s' "$response" | jq -r '.build_slug // empty')"
 
           if [ "$status" != "ok" ]; then
-            echo "Bitrise trigger failed. Unexpected response status: '${status}'. Full response:" >&2
+            msg="Bitrise trigger failed for sdk_build. Unexpected response status: '${status:-<empty>}'. See the step log for the full response."
+            echo "::error title=Bitrise trigger failed::${msg}"
+            printf '## ❌ Bitrise trigger failed\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
+            echo "Full Bitrise response:" >&2
             printf '%s\n' "$response" >&2
             exit 1
           fi
