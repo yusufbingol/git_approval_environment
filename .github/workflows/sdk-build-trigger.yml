@@ -162,7 +162,18 @@ jobs:
             name_version="${version_name%-*}"
             if [ "$branch_version" != "$name_version" ]; then
               echo "Branch version (${branch_version}) does not match VERSION_NAME version part (${name_version})."
-              echo "Manual confirmation required via the 'version-mismatch-confirmation' environment."
+              echo "::notice title=Branch/version mismatch confirmation pending::Branch '${CURRENT_BRANCH}' version (${branch_version}) does not match VERSION_NAME '${version_name}' version part (${name_version}). Approve via Review deployments ('version-mismatch-confirmation' environment)."
+              # Shown to the reviewer BEFORE approval (GitHub's "Review
+              # deployments" modal is not customizable, so the details live
+              # here and in the confirm_version_mismatch job name).
+              {
+                echo "## ⚠️ Branch/Version Mismatch Confirmation Pending"
+                echo ""
+                echo "- Branch: \`${CURRENT_BRANCH}\` (version part: \`${branch_version}\`)"
+                echo "- VERSION_NAME: \`${version_name}\` (version part: \`${name_version}\`)"
+                echo ""
+                echo "_Approve via Review deployments._"
+              } >> "$GITHUB_STEP_SUMMARY"
               needs_mismatch_approval=true
             fi
           fi
@@ -252,6 +263,38 @@ jobs:
             echo "_Approve via Review deployments._"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Prepare publish approval summary
+        if: inputs.publish
+        env:
+          INTERNAL_ONLY: ${{ inputs.internal_only }}
+          JFROG_PROJECT: ${{ steps.resolve.outputs.jfrog_project }}
+          INTERNAL_VERSION_SUFFIX: ${{ steps.resolve.outputs.internal_version_suffix }}
+        run: |
+          set -euo pipefail
+
+          if [ "$INTERNAL_ONLY" = "true" ]; then
+            scope="internal only (astint) — rehearsal/RC, not customer-facing"
+          else
+            scope="customer-facing distribution (assistbox)"
+          fi
+          echo "::notice title=SDK publish approval pending::Branch '${GITHUB_REF_NAME}' will publish SDK artifacts to JFROG_PROJECT '${JFROG_PROJECT}' (${scope}). Approve via Review deployments."
+
+          # Shown to the reviewer BEFORE approval (GitHub's "Review deployments"
+          # modal is not customizable, so the details live here and in the
+          # approve_publish job name).
+          {
+            echo "## ⚠️ SDK Publish Approval Pending"
+            echo ""
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo "- JFROG_PROJECT: \`${JFROG_PROJECT}\`"
+            echo "- Scope: ${scope}"
+            if [ "$INTERNAL_ONLY" = "true" ]; then
+              echo "- INTERNAL_VERSION_SUFFIX: \`${INTERNAL_VERSION_SUFFIX}\`"
+            fi
+            echo ""
+            echo "_Approve via Review deployments._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   approve_version_update:
     name: "⚠️ [${{ github.ref_name }}] Approve version update: Current ${{ needs.validate.outputs.current_version_name }} (${{ needs.validate.outputs.current_version_code }}) -> New ${{ needs.validate.outputs.version_name }} (${{ needs.validate.outputs.version_code }})?"
     runs-on: ubuntu-latest
@@ -274,7 +317,7 @@ jobs:
           echo "Reviewer approved version update: ${CURRENT_NAME} (${CURRENT_CODE}) -> ${NEW_NAME} (${NEW_CODE})."
 
   approve_publish:
-    name: Approve SDK publish
+    name: "⚠️ [${{ github.ref_name }}] Approve SDK publish to JFROG_PROJECT '${{ needs.validate.outputs.jfrog_project }}'${{ inputs.internal_only && ' (internal only)' || '' }}?"
     runs-on: ubuntu-latest
     needs: validate
     if: inputs.publish
@@ -295,7 +338,7 @@ jobs:
           fi
 
   confirm_version_mismatch:
-    name: Confirm branch/version mismatch
+    name: "⚠️ [${{ github.ref_name }}] Confirm branch/version mismatch: branch vs VERSION_NAME '${{ needs.validate.outputs.version_name }}'?"
     runs-on: ubuntu-latest
     needs: validate
     if: needs.validate.outputs.needs_mismatch_approval == 'true'
