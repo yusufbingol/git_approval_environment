@@ -15,6 +15,10 @@
 #     publish confirmation prompt).
 #   - version-mismatch-confirmation: approval gate when update_version=true
 #     and a vX.Y.Z branch does not match VERSION_NAME.
+#   - version-update-approval: approval gate when update_version=true. The
+#     gated job's name shows "Current X (code) -> New Y (code)" (read from
+#     gradle.properties on the branch) so the reviewer confirms the exact
+#     version change; a comparison table is also written to the run summary.
 #
 # Env mapping to Bitrise (identical to Jenkins):
 #   - CURRENT_BRANCH: always
@@ -74,7 +78,13 @@ jobs:
       internal_version_suffix: ${{ steps.resolve.outputs.internal_version_suffix }}
       jfrog_project: ${{ steps.resolve.outputs.jfrog_project }}
       needs_mismatch_approval: ${{ steps.resolve.outputs.needs_mismatch_approval }}
+      current_version_name: ${{ steps.current.outputs.current_name }}
+      current_version_code: ${{ steps.current.outputs.current_code }}
     steps:
+      - name: Checkout
+        if: inputs.update_version
+        uses: actions/checkout@v4
+
       - name: Resolve and validate parameters
         id: resolve
         env:
@@ -170,6 +180,72 @@ jobs:
             echo "needs_mismatch_approval=${needs_mismatch_approval}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Read current version and compare
+        id: current
+        if: inputs.update_version
+        env:
+          NEW_NAME: ${{ steps.resolve.outputs.version_name }}
+          NEW_CODE: ${{ steps.resolve.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          current_name="$(sed -n 's/^VERSION_NAME=//p' gradle.properties | tr -d '[:space:]')"
+          current_code="$(sed -n 's/^VERSION_CODE=//p' gradle.properties | tr -d '[:space:]')"
+          if [ -z "$current_name" ] || [ -z "$current_code" ]; then
+            echo "VERSION_NAME/VERSION_CODE not found in gradle.properties on this branch." >&2
+            exit 1
+          fi
+
+          # Guard against non-increasing values (wrong-input protection).
+          errors=()
+          if [ "$NEW_NAME" = "$current_name" ]; then
+            errors+=("version_name (${NEW_NAME}) is the same as the current version")
+          fi
+          if [ "$NEW_CODE" -le "$current_code" ]; then
+            errors+=("version_code (${NEW_CODE}) must be greater than the current code (${current_code})")
+          fi
+          if [ "${#errors[@]}" -gt 0 ]; then
+            echo "Invalid version input:" >&2
+            printf ' - %s\n' "${errors[@]}" >&2
+            exit 1
+          fi
+
+          {
+            echo "current_name=${current_name}"
+            echo "current_code=${current_code}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## ⚠️ Versiyon Güncelleme Onayı Bekleniyor"
+            echo ""
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo ""
+            echo "|        | VERSION_NAME | VERSION_CODE |"
+            echo "|--------|--------------|--------------|"
+            echo "| Mevcut | \`${current_name}\` | \`${current_code}\` |"
+            echo "| Yeni   | \`${NEW_NAME}\` | \`${NEW_CODE}\` |"
+            echo ""
+            echo "Onaylamak için bekleyen deployment'ı **Review deployments** ile onaylayın."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  approve_version_update:
+    name: "⚠️ [${{ github.ref_name }}] Current ${{ needs.validate.outputs.current_version_name }} (${{ needs.validate.outputs.current_version_code }}) -> New ${{ needs.validate.outputs.version_name }} (${{ needs.validate.outputs.version_code }}) onaylıyor musunuz?"
+    runs-on: ubuntu-latest
+    needs: validate
+    if: inputs.update_version
+    # Requires the 'version-update-approval' GitHub Environment with required
+    # reviewers. The job name shows the exact current -> new version change.
+    environment: version-update-approval
+    steps:
+      - name: Version update approved by reviewer
+        env:
+          CURRENT_NAME: ${{ needs.validate.outputs.current_version_name }}
+          CURRENT_CODE: ${{ needs.validate.outputs.current_version_code }}
+          NEW_NAME: ${{ needs.validate.outputs.version_name }}
+          NEW_CODE: ${{ needs.validate.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          echo "Reviewer approved version update: ${CURRENT_NAME} (${CURRENT_CODE}) -> ${NEW_NAME} (${NEW_CODE})."
+
   approve_publish:
     name: Approve SDK publish
     runs-on: ubuntu-latest
@@ -211,10 +287,11 @@ jobs:
   trigger:
     name: Trigger Bitrise sdk_build
     runs-on: ubuntu-latest
-    needs: [validate, approve_publish, confirm_version_mismatch]
+    needs: [validate, approve_version_update, approve_publish, confirm_version_mismatch]
     if: >-
       always() &&
       needs.validate.result == 'success' &&
+      (inputs.update_version != true || needs.approve_version_update.result == 'success') &&
       (inputs.publish != true || needs.approve_publish.result == 'success') &&
       (needs.validate.outputs.needs_mismatch_approval != 'true' || needs.confirm_version_mismatch.result == 'success')
     steps:
