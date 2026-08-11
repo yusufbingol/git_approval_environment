@@ -188,10 +188,14 @@ jobs:
           NEW_CODE: ${{ steps.resolve.outputs.version_code }}
         run: |
           set -euo pipefail
-          current_name="$(sed -n 's/^VERSION_NAME=//p' gradle.properties | tr -d '[:space:]')"
-          current_code="$(sed -n 's/^VERSION_CODE=//p' gradle.properties | tr -d '[:space:]')"
+          current_name="$(sed -n 's/^assistbox\.versionName=//p' gradle.properties | tr -d '[:space:]')"
+          current_code="$(sed -n 's/^assistbox\.versionCode=//p' gradle.properties | tr -d '[:space:]')"
           if [ -z "$current_name" ] || [ -z "$current_code" ]; then
-            echo "VERSION_NAME/VERSION_CODE not found in gradle.properties on this branch." >&2
+            echo "assistbox.versionName/assistbox.versionCode not found in gradle.properties on this branch." >&2
+            exit 1
+          fi
+          if ! printf '%s' "$current_code" | grep -Eq '^[0-9]+$'; then
+            echo "assistbox.versionCode in gradle.properties must be an integer. Found: '${current_code}'" >&2
             exit 1
           fi
 

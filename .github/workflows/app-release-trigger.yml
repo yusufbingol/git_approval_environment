@@ -1,0 +1,348 @@
+# App Release Trigger (GitHub Actions -> Bitrise)
+#
+# Parallel-period replacement for ci/jenkins/app_pipeline.groovy (Jenkins stays
+# active during the migration). This workflow does NO building: it validates
+# parameters and triggers the Bitrise `app_release` workflow via the Build
+# Trigger API, exactly like Jenkins does. Fire-and-forget: no Bitrise polling.
+#
+# Branch selection: the branch this workflow is run from (github.ref_name) is
+# sent to Bitrise as CURRENT_BRANCH. There is no separate branch input.
+#
+# Required repo secrets: BITRISE_BUILD_TRIGGER_TOKEN, BITRISE_APP_SLUG
+# Required repo variable: ANDROID_PERIODIC_BUILD_ENABLED (schedule guard;
+#   scheduled runs no-op unless it is exactly 'true' — keeps Jenkins the only
+#   periodic trigger during the parallel period).
+# Required GitHub Environments (with required reviewers):
+#   - version-mismatch-confirmation: approval gate when a vX.Y.Z branch does
+#     not match VERSION_NAME.
+#   - version-update-approval: approval gate for every manual run (every app
+#     release updates the version); the reviewer sees "Current X -> New Y" in
+#     the job name and the run summary before approving. Scheduled runs skip
+#     this gate (versions are computed automatically, Jenkins timer parity).
+#
+# See .github/workflows/README.md for full setup instructions.
+
+name: App Release Trigger
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Version Name in VERSION_NUMBER-BUILD_NUMBER format (example: 19.0.0-1)'
+        required: true
+        type: string
+      version_code:
+        description: 'Version Code (always incrementing integer)'
+        required: true
+        type: string
+  schedule:
+    # OPEN ITEM: the Jenkins periodic cadence is configured on the Jenkins job
+    # itself (not recorded in this repo). Daily 03:00 UTC is a placeholder —
+    # align it with the actual Jenkins cron before enabling
+    # ANDROID_PERIODIC_BUILD_ENABLED.
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate parameters
+    runs-on: ubuntu-latest
+    outputs:
+      should_trigger: ${{ steps.resolve.outputs.should_trigger }}
+      version_name: ${{ steps.resolve.outputs.version_name }}
+      version_code: ${{ steps.resolve.outputs.version_code }}
+      needs_mismatch_approval: ${{ steps.resolve.outputs.needs_mismatch_approval }}
+      current_version_name: ${{ steps.current.outputs.current_name }}
+      current_version_code: ${{ steps.current.outputs.current_code }}
+    steps:
+      - name: Guard scheduled runs (parallel period with Jenkins)
+        id: schedule_guard
+        if: github.event_name == 'schedule'
+        env:
+          PERIODIC_ENABLED: ${{ vars.ANDROID_PERIODIC_BUILD_ENABLED }}
+        run: |
+          set -euo pipefail
+          if [ "${PERIODIC_ENABLED:-}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Periodic app build skipped"
+              echo ""
+              echo "Repo variable \`ANDROID_PERIODIC_BUILD_ENABLED\` is not \`true\`."
+              echo "During the parallel period Jenkins owns the periodic build;"
+              echo "set the variable to \`true\` only after disabling the Jenkins timer."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Periodic build disabled (ANDROID_PERIODIC_BUILD_ENABLED != 'true'). Exiting successfully."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        # Scheduled runs read the current version to compute the next one;
+        # manual runs read it for the version-update approval comparison.
+        if: steps.schedule_guard.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Read current version from gradle.properties
+        id: current
+        if: steps.schedule_guard.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          # Version source of truth: root gradle.properties
+          # (assistbox.versionName / assistbox.versionCode — same keys Fastlane
+          # VersionHelper reads and rewrites).
+          current_name="$(sed -n 's/^assistbox\.versionName=//p' gradle.properties | tr -d '[:space:]')"
+          current_code="$(sed -n 's/^assistbox\.versionCode=//p' gradle.properties | tr -d '[:space:]')"
+
+          if ! printf '%s' "$current_code" | grep -Eq '^[0-9]+$'; then
+            echo "assistbox.versionCode in gradle.properties must be an integer. Found: '$current_code'" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$current_name" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$'; then
+            echo "assistbox.versionName in gradle.properties must be in VERSION_NUMBER-BUILD_NUMBER format. Found: '$current_name'" >&2
+            exit 1
+          fi
+
+          {
+            echo "current_name=${current_name}"
+            echo "current_code=${current_code}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute next versions (scheduled)
+        id: compute
+        if: github.event_name == 'schedule' && steps.schedule_guard.outputs.skip != 'true'
+        env:
+          CURRENT_NAME: ${{ steps.current.outputs.current_name }}
+          CURRENT_CODE: ${{ steps.current.outputs.current_code }}
+        run: |
+          set -euo pipefail
+          next_code=$((CURRENT_CODE + 1))
+          version_part="${CURRENT_NAME%-*}"
+          build_number="${CURRENT_NAME##*-}"
+          next_name="${version_part}-$((build_number + 1))"
+
+          echo "Computed next versions: VERSION_CODE=${next_code}, VERSION_NAME=${next_name} (from ${CURRENT_CODE} / ${CURRENT_NAME})"
+          echo "version_code=${next_code}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${next_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve and validate parameters
+        id: resolve
+        if: steps.schedule_guard.outputs.skip != 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CURRENT_BRANCH: ${{ github.ref_name }}
+          INPUT_VERSION_NAME: ${{ inputs.version_name }}
+          INPUT_VERSION_CODE: ${{ inputs.version_code }}
+          COMPUTED_VERSION_NAME: ${{ steps.compute.outputs.version_name }}
+          COMPUTED_VERSION_CODE: ${{ steps.compute.outputs.version_code }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            version_name="$COMPUTED_VERSION_NAME"
+            version_code="$COMPUTED_VERSION_CODE"
+          else
+            version_name="$(printf '%s' "$INPUT_VERSION_NAME" | tr -d '[:space:]')"
+            version_code="$(printf '%s' "$INPUT_VERSION_CODE" | tr -d '[:space:]')"
+          fi
+
+          errors=()
+          if [ -z "$version_code" ]; then
+            errors+=("VERSION_CODE is required")
+          elif ! printf '%s' "$version_code" | grep -Eq '^[0-9]+$'; then
+            errors+=("VERSION_CODE must be an integer")
+          fi
+
+          if [ -z "$version_name" ]; then
+            errors+=("VERSION_NAME is required")
+          elif ! printf '%s' "$version_name" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$'; then
+            errors+=("VERSION_NAME must be in VERSION_NUMBER-BUILD_NUMBER format (example: 19.0.0-1)")
+          fi
+
+          if [ "${#errors[@]}" -gt 0 ]; then
+            echo "Required parameters are missing or invalid:" >&2
+            printf ' - %s\n' "${errors[@]}" >&2
+            exit 1
+          fi
+
+          # vX.Y.Z branch vs VERSION_NAME version-part mismatch check.
+          # Manual runs: route through the version-mismatch-confirmation
+          # environment (reviewer approval) instead of hard-failing.
+          # Scheduled runs: abort on any risky condition.
+          needs_mismatch_approval=false
+          if printf '%s' "$CURRENT_BRANCH" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            branch_version="${CURRENT_BRANCH#v}"
+            name_version="${version_name%-*}"
+            if [ "$branch_version" != "$name_version" ]; then
+              if [ "$EVENT_NAME" = "schedule" ]; then
+                echo "ABORTED: Branch version (${branch_version}) does not match VERSION_NAME version part (${name_version}) on a scheduled run." >&2
+                exit 1
+              fi
+              echo "Branch version (${branch_version}) does not match VERSION_NAME version part (${name_version})."
+              echo "Manual confirmation required via the 'version-mismatch-confirmation' environment."
+              needs_mismatch_approval=true
+            fi
+          fi
+
+          echo "Deployment will be triggered with: CURRENT_BRANCH=${CURRENT_BRANCH}, VERSION_NAME=${version_name}, VERSION_CODE=${version_code}"
+          {
+            echo "should_trigger=true"
+            echo "version_name=${version_name}"
+            echo "version_code=${version_code}"
+            echo "needs_mismatch_approval=${needs_mismatch_approval}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate version update and prepare approval summary
+        id: guard
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CURRENT_NAME: ${{ steps.current.outputs.current_name }}
+          CURRENT_CODE: ${{ steps.current.outputs.current_code }}
+          NEW_NAME: ${{ steps.resolve.outputs.version_name }}
+          NEW_CODE: ${{ steps.resolve.outputs.version_code }}
+        run: |
+          set -euo pipefail
+
+          # Guard against mistyped inputs before asking a reviewer to approve.
+          errors=()
+          if [ "$NEW_NAME" = "$CURRENT_NAME" ]; then
+            errors+=("New VERSION_NAME '${NEW_NAME}' is identical to the current version in gradle.properties — nothing to update")
+          fi
+          if [ "$NEW_CODE" -le "$CURRENT_CODE" ]; then
+            errors+=("New VERSION_CODE '${NEW_CODE}' must be greater than the current VERSION_CODE '${CURRENT_CODE}'")
+          fi
+          if [ "${#errors[@]}" -gt 0 ]; then
+            echo "Version update inputs are invalid:" >&2
+            printf ' - %s\n' "${errors[@]}" >&2
+            exit 1
+          fi
+
+          # Shown to the reviewer BEFORE approval (GitHub's "Review deployments"
+          # modal is not customizable, so the comparison lives here and in the
+          # approve_version_update job name).
+          {
+            echo "## ⚠️ Version Update Approval Pending"
+            echo ""
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo ""
+            echo "| | VERSION_NAME | VERSION_CODE |"
+            echo "|---|---|---|"
+            echo "| Current | \`${CURRENT_NAME}\` | \`${CURRENT_CODE}\` |"
+            echo "| New | \`${NEW_NAME}\` | \`${NEW_CODE}\` |"
+            echo ""
+            echo "_Approve via Review deployments._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  approve_version_update:
+    name: "⚠️ [${{ github.ref_name }}] Approve version update: Current ${{ needs.validate.outputs.current_version_name }} (${{ needs.validate.outputs.current_version_code }}) -> New ${{ needs.validate.outputs.version_name }} (${{ needs.validate.outputs.version_code }})?"
+    runs-on: ubuntu-latest
+    needs: validate
+    # Manual runs only: every app release is a version update, so every manual
+    # run needs this approval. Scheduled runs compute the versions from
+    # gradle.properties automatically and stay unattended (Jenkins timer parity).
+    if: github.event_name == 'workflow_dispatch'
+    # Requires the 'version-update-approval' GitHub Environment with required
+    # reviewers (shared with the SDK workflow). The current -> new comparison
+    # is surfaced in the job name and the validate job's step summary (the
+    # approval modal itself cannot be customized).
+    environment: version-update-approval
+    steps:
+      - name: Version update approved by reviewer
+        env:
+          CURRENT_NAME: ${{ needs.validate.outputs.current_version_name }}
+          CURRENT_CODE: ${{ needs.validate.outputs.current_version_code }}
+          NEW_NAME: ${{ needs.validate.outputs.version_name }}
+          NEW_CODE: ${{ needs.validate.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          echo "Reviewer approved version update: ${CURRENT_NAME} (${CURRENT_CODE}) -> ${NEW_NAME} (${NEW_CODE})."
+
+  confirm_version_mismatch:
+    name: Confirm branch/version mismatch
+    runs-on: ubuntu-latest
+    needs: validate
+    if: needs.validate.outputs.should_trigger == 'true' && needs.validate.outputs.needs_mismatch_approval == 'true'
+    # Requires the 'version-mismatch-confirmation' GitHub Environment with
+    # required reviewers (approval == Jenkins "Yes, Continue" input step).
+    environment: version-mismatch-confirmation
+    steps:
+      - name: Mismatch confirmed by reviewer
+        env:
+          CURRENT_BRANCH: ${{ github.ref_name }}
+          VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+        run: |
+          set -euo pipefail
+          echo "Reviewer approved: branch '${CURRENT_BRANCH}' does not match VERSION_NAME '${VERSION_NAME}' version part. Continuing."
+
+  trigger:
+    name: Trigger Bitrise app_release
+    runs-on: ubuntu-latest
+    needs: [validate, confirm_version_mismatch, approve_version_update]
+    if: >-
+      always() &&
+      needs.validate.result == 'success' &&
+      needs.validate.outputs.should_trigger == 'true' &&
+      (github.event_name != 'workflow_dispatch' || needs.approve_version_update.result == 'success') &&
+      (needs.validate.outputs.needs_mismatch_approval != 'true' || needs.confirm_version_mismatch.result == 'success')
+    steps:
+      - name: Trigger Bitrise build (fire-and-forget)
+        env:
+          BITRISE_BUILD_TRIGGER_TOKEN: ${{ secrets.BITRISE_BUILD_TRIGGER_TOKEN }}
+          BITRISE_APP_SLUG: ${{ secrets.BITRISE_APP_SLUG }}
+          CURRENT_BRANCH: ${{ github.ref_name }}
+          VERSION_NAME: ${{ needs.validate.outputs.version_name }}
+          VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          # Never enable xtrace here: the payload contains the trigger token.
+
+          if [ -z "${BITRISE_BUILD_TRIGGER_TOKEN:-}" ] || [ -z "${BITRISE_APP_SLUG:-}" ]; then
+            echo "Missing required secrets: BITRISE_BUILD_TRIGGER_TOKEN and/or BITRISE_APP_SLUG." >&2
+            exit 1
+          fi
+
+          payload="$(jq -n \
+            --arg token "$BITRISE_BUILD_TRIGGER_TOKEN" \
+            --arg branch "$CURRENT_BRANCH" \
+            --arg version_name "$VERSION_NAME" \
+            --arg version_code "$VERSION_CODE" \
+            '{
+              hook_info: {type: "bitrise", build_trigger_token: $token},
+              build_params: {
+                branch: $branch,
+                workflow_id: "app_release",
+                environments: [
+                  {mapped_to: "CURRENT_BRANCH", value: $branch, is_expand: true},
+                  {mapped_to: "VERSION_NAME", value: $version_name, is_expand: true},
+                  {mapped_to: "VERSION_CODE", value: $version_code, is_expand: true}
+                ]
+              },
+              triggered_by: "github-actions"
+            }')"
+
+          response="$(curl "https://app.bitrise.io/app/${BITRISE_APP_SLUG}/build/start.json" \
+            --silent --show-error --fail \
+            --data "$payload")"
+
+          status="$(printf '%s' "$response" | jq -r '.status // empty' | tr '[:upper:]' '[:lower:]')"
+          build_slug="$(printf '%s' "$response" | jq -r '.build_slug // empty')"
+
+          if [ "$status" != "ok" ]; then
+            echo "Bitrise trigger failed. Unexpected response status: '${status}'. Full response:" >&2
+            printf '%s\n' "$response" >&2
+            exit 1
+          fi
+
+          build_url="https://app.bitrise.io/build/${build_slug}"
+          echo "Bitrise build triggered successfully. Build slug: ${build_slug:-N/A}"
+          {
+            echo "## Bitrise app_release triggered"
+            echo ""
+            echo "- Branch: \`${CURRENT_BRANCH}\`"
+            echo "- VERSION_NAME: \`${VERSION_NAME}\`"
+            echo "- VERSION_CODE: \`${VERSION_CODE}\`"
+            echo "- Build: ${build_url}"
+            echo ""
+            echo "_Fire-and-forget: build status is tracked on Bitrise, not here._"
+          } >> "$GITHUB_STEP_SUMMARY"
