@@ -1,0 +1,133 @@
+# Version Approval Test
+#
+# Experiment: show a dynamic "Current X -> New Y, do you approve?" message on
+# an Environment approval gate. The dynamic text appears in the JOB NAME of
+# the gated job (job names support the `needs` context) and in the run's
+# step summary — the "Review deployments" modal itself cannot be customized.
+#
+# Flow:
+#   1. User enters version_name / version_code via workflow_dispatch.
+#   2. `read_current` checks out the repo, reads the current version from
+#      gradle.properties, validates the new values and writes a comparison
+#      table to the step summary.
+#   3. `approve_version` waits on the `version-update-approval` environment;
+#      its job name shows "Current ... -> New ... onaylıyor musunuz?".
+#   4. `apply` is a stand-in for the real trigger step.
+#
+# Required GitHub Environment (with required reviewers): version-update-approval
+
+name: Version Approval Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'New Version Name in VERSION_NUMBER-BUILD_NUMBER format (example: 19.1.0-1)'
+        required: true
+        type: string
+      version_code:
+        description: 'New Version Code (integer, example: 19002)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  read_current:
+    name: Read current version
+    runs-on: ubuntu-latest
+    outputs:
+      current_name: ${{ steps.current.outputs.current_name }}
+      current_code: ${{ steps.current.outputs.current_code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read current version from gradle.properties
+        id: current
+        run: |
+          set -euo pipefail
+          current_name="$(sed -n 's/^VERSION_NAME=//p' gradle.properties | tr -d '[:space:]')"
+          current_code="$(sed -n 's/^VERSION_CODE=//p' gradle.properties | tr -d '[:space:]')"
+          if [ -z "$current_name" ] || [ -z "$current_code" ]; then
+            echo "VERSION_NAME/VERSION_CODE not found in gradle.properties" >&2
+            exit 1
+          fi
+          echo "current_name=${current_name}" >> "$GITHUB_OUTPUT"
+          echo "current_code=${current_code}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate new version against current
+        env:
+          CURRENT_NAME: ${{ steps.current.outputs.current_name }}
+          CURRENT_CODE: ${{ steps.current.outputs.current_code }}
+          NEW_NAME: ${{ inputs.version_name }}
+          NEW_CODE: ${{ inputs.version_code }}
+        run: |
+          set -euo pipefail
+          new_name="$(printf '%s' "$NEW_NAME" | tr -d '[:space:]')"
+          new_code="$(printf '%s' "$NEW_CODE" | tr -d '[:space:]')"
+
+          errors=()
+          if ! printf '%s' "$new_name" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$'; then
+            errors+=("version_name must be in VERSION_NUMBER-BUILD_NUMBER format (example: 19.1.0-1)")
+          fi
+          if ! printf '%s' "$new_code" | grep -Eq '^[0-9]+$'; then
+            errors+=("version_code must be an integer")
+          fi
+
+          # Guard against non-increasing values (wrong-input protection).
+          if [ "${#errors[@]}" -eq 0 ]; then
+            if [ "$new_name" = "$CURRENT_NAME" ]; then
+              errors+=("version_name (${new_name}) is the same as the current version")
+            fi
+            if [ "$new_code" -le "$CURRENT_CODE" ]; then
+              errors+=("version_code (${new_code}) must be greater than the current code (${CURRENT_CODE})")
+            fi
+          fi
+
+          if [ "${#errors[@]}" -gt 0 ]; then
+            echo "Invalid input:" >&2
+            printf ' - %s\n' "${errors[@]}" >&2
+            exit 1
+          fi
+
+      - name: Write comparison to summary
+        env:
+          CURRENT_NAME: ${{ steps.current.outputs.current_name }}
+          CURRENT_CODE: ${{ steps.current.outputs.current_code }}
+          NEW_NAME: ${{ inputs.version_name }}
+          NEW_CODE: ${{ inputs.version_code }}
+        run: |
+          {
+            echo "## ⚠️ Versiyon Güncelleme Onayı Bekleniyor"
+            echo ""
+            echo "|        | VERSION_NAME | VERSION_CODE |"
+            echo "|--------|--------------|--------------|"
+            echo "| Mevcut | \`${CURRENT_NAME}\` | \`${CURRENT_CODE}\` |"
+            echo "| Yeni   | \`${NEW_NAME}\` | \`${NEW_CODE}\` |"
+            echo ""
+            echo "Onaylamak için bekleyen deployment'ı **Review deployments** ile onaylayın."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  approve_version:
+    name: "⚠️ Current ${{ needs.read_current.outputs.current_name }} (${{ needs.read_current.outputs.current_code }}) -> New ${{ inputs.version_name }} (${{ inputs.version_code }}) onaylıyor musunuz?"
+    needs: read_current
+    runs-on: ubuntu-latest
+    environment: version-update-approval
+    steps:
+      - name: Version update approved
+        run: echo "Reviewer approved version update ${{ needs.read_current.outputs.current_name }} -> ${{ inputs.version_name }}"
+
+  apply:
+    name: Apply (stand-in for Bitrise trigger)
+    runs-on: ubuntu-latest
+    needs: [read_current, approve_version]
+    steps:
+      - name: Simulate trigger
+        env:
+          CURRENT_NAME: ${{ needs.read_current.outputs.current_name }}
+          NEW_NAME: ${{ inputs.version_name }}
+          NEW_CODE: ${{ inputs.version_code }}
+        run: |
+          echo "Approved: would trigger build with VERSION_NAME=${NEW_NAME}, VERSION_CODE=${NEW_CODE} (was ${CURRENT_NAME})"
