@@ -196,7 +196,18 @@ jobs:
                 exit 1
               fi
               echo "Branch version (${branch_version}) does not match VERSION_NAME version part (${name_version})."
-              echo "Manual confirmation required via the 'version-mismatch-confirmation' environment."
+              echo "::notice title=Branch/version mismatch confirmation pending::Branch '${CURRENT_BRANCH}' version (${branch_version}) does not match VERSION_NAME '${version_name}' version part (${name_version}). Approve via Review deployments ('version-mismatch-confirmation' environment)."
+              # Shown to the reviewer BEFORE approval (GitHub's "Review
+              # deployments" modal is not customizable, so the details live
+              # here and in the confirm_version_mismatch job name).
+              {
+                echo "## ⚠️ Branch/Version Mismatch Confirmation Pending"
+                echo ""
+                echo "- Branch: \`${CURRENT_BRANCH}\` (version part: \`${branch_version}\`)"
+                echo "- VERSION_NAME: \`${version_name}\` (version part: \`${name_version}\`)"
+                echo ""
+                echo "_Approve via Review deployments._"
+              } >> "$GITHUB_STEP_SUMMARY"
               needs_mismatch_approval=true
             fi
           fi
@@ -285,7 +296,7 @@ jobs:
           echo "Reviewer approved version update: ${CURRENT_NAME} (${CURRENT_CODE}) -> ${NEW_NAME} (${NEW_CODE})."
 
   confirm_version_mismatch:
-    name: Confirm branch/version mismatch
+    name: "⚠️ [${{ github.ref_name }}] Confirm branch/version mismatch: branch vs VERSION_NAME '${{ needs.validate.outputs.version_name }}'?"
     runs-on: ubuntu-latest
     needs: validate
     if: needs.validate.outputs.should_trigger == 'true' && needs.validate.outputs.needs_mismatch_approval == 'true'
