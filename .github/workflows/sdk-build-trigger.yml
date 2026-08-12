@@ -81,7 +81,8 @@ jobs:
       current_version_code: ${{ steps.current.outputs.current_code }}
     steps:
       - name: Checkout
-        if: inputs.update_version
+        # Always needed: the run summary shows the version from
+        # gradle.properties even when update_version is false.
         uses: actions/checkout@v4
 
       - name: Resolve and validate parameters
@@ -203,8 +204,13 @@ jobs:
             echo "- PUBLISH: \`${INPUT_PUBLISH}\`"
             echo "- UPDATE_VERSION: \`${INPUT_UPDATE_VERSION}\`"
             if [ "$INPUT_UPDATE_VERSION" = "true" ]; then
-              echo "- VERSION_NAME: \`${version_name}\`"
-              echo "- VERSION_CODE: \`${version_code}\`"
+              echo "- VERSION_NAME: \`${version_name}\` (new)"
+              echo "- VERSION_CODE: \`${version_code}\` (new)"
+            else
+              gp_name="$(sed -n 's/^assistbox\.versionName=//p' gradle.properties | tr -d '[:space:]')"
+              gp_code="$(sed -n 's/^assistbox\.versionCode=//p' gradle.properties | tr -d '[:space:]')"
+              echo "- VERSION_NAME: \`${gp_name:-<unreadable>}\` (current from gradle.properties, unchanged)"
+              echo "- VERSION_CODE: \`${gp_code:-<unreadable>}\` (current from gradle.properties, unchanged)"
             fi
             if [ "$INPUT_PUBLISH" = "true" ]; then
               echo "- INTERNAL_ONLY: \`${INPUT_INTERNAL_ONLY}\`"
