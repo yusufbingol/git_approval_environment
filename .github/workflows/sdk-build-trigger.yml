@@ -44,7 +44,7 @@ on:
         type: boolean
         default: false
       version_name:
-        description: 'Version Name in VERSION_NUMBER-BUILD_NUMBER format (required when update_version is checked)'
+        description: 'Version Name in VERSION_NUMBER-BUILD_NUMBER format (example: 19.0.0-1; required when update_version is checked)'
         required: false
         type: string
         default: ''
