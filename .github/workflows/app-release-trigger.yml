@@ -148,6 +148,17 @@ jobs:
           echo "version_code=${next_code}" >> "$GITHUB_OUTPUT"
           echo "version_name=${next_name}" >> "$GITHUB_OUTPUT"
 
+          {
+            echo "## 🕐 Scheduled Periodic Build"
+            echo ""
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo ""
+            echo "| | VERSION_NAME | VERSION_CODE |"
+            echo "|---|---|---|"
+            echo "| Current (gradle.properties) | \`${CURRENT_NAME}\` | \`${CURRENT_CODE}\` |"
+            echo "| Next (auto-incremented) | \`${next_name}\` | \`${next_code}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Resolve and validate parameters
         id: resolve
         if: steps.schedule_guard.outputs.skip != 'true'
@@ -274,9 +285,9 @@ jobs:
           # modal is not customizable, so the comparison lives here and in the
           # approve_version_update job name).
           if [ "${PERIODIC_ENABLED:-}" = "true" ]; then
-            periodic_note="🟢 Periodic (scheduled) build is currently ENABLED (\`ANDROID_PERIODIC_BUILD_ENABLED=true\`) — the nightly schedule will keep auto-incrementing versions from gradle.properties."
+            periodic_note="🟢 Periodic (scheduled) build is currently ENABLED (\`ANDROID_PERIODIC_BUILD_ENABLED=true\`) — the periodic schedule (Mon–Sat 07:00 UTC) will keep auto-incrementing versions from gradle.properties."
           else
-            periodic_note="⚪ Periodic (scheduled) build is currently DISABLED (\`ANDROID_PERIODIC_BUILD_ENABLED\` is not \`true\`) — scheduled runs are no-ops; only manual releases trigger builds."
+            periodic_note="⚪ Periodic (scheduled) build is currently DISABLED (\`ANDROID_PERIODIC_BUILD_ENABLED\` is not \`true\`) — scheduled runs cancel themselves; only manual releases trigger builds."
           fi
           {
             echo "## ⚠️ Version Update Approval Pending"
