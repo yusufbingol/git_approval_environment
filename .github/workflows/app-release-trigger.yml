@@ -10,8 +10,9 @@
 #
 # Required repo secrets: BITRISE_BUILD_TRIGGER_TOKEN, BITRISE_APP_SLUG
 # Required repo variable: ANDROID_PERIODIC_BUILD_ENABLED (schedule guard;
-#   scheduled runs no-op unless it is exactly 'true' — keeps Jenkins the only
-#   periodic trigger during the parallel period).
+#   scheduled runs cancel themselves (gray "cancelled" status) unless it is
+#   exactly 'true' — keeps Jenkins the only periodic trigger during the
+#   parallel period).
 # Required GitHub Environments (with required reviewers):
 #   - version-mismatch-confirmation: approval gate when a vX.Y.Z branch does
 #     not match VERSION_NAME.
@@ -44,6 +45,9 @@ on:
 
 permissions:
   contents: read
+  # Required so a disabled scheduled run can cancel itself (gray "cancelled"
+  # status instead of a misleading green "success").
+  actions: write
 
 jobs:
   validate:
@@ -62,6 +66,7 @@ jobs:
         if: github.event_name == 'schedule'
         env:
           PERIODIC_ENABLED: ${{ vars.ANDROID_PERIODIC_BUILD_ENABLED }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "${PERIODIC_ENABLED:-}" != "true" ]; then
@@ -73,7 +78,16 @@ jobs:
               echo "During the parallel period Jenkins owns the periodic build;"
               echo "set the variable to \`true\` only after disabling the Jenkins timer."
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "Periodic build disabled (ANDROID_PERIODIC_BUILD_ENABLED != 'true'). Exiting successfully."
+            echo "::notice title=Periodic app build skipped::ANDROID_PERIODIC_BUILD_ENABLED is not 'true'. Cancelling this run so it does not show as a successful build."
+            # Cancel this run so it ends with a gray "cancelled" status instead
+            # of a misleading green "success". The sleep gives the cancellation
+            # time to take effect before the step would complete.
+            gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"
+            sleep 120
+            # Safety net: if the cancellation did not land, fail loudly rather
+            # than finish green.
+            echo "Run cancellation did not take effect within 120s." >&2
+            exit 1
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
