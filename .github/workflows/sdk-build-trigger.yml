@@ -196,6 +196,25 @@ jobs:
             echo "needs_mismatch_approval=${needs_mismatch_approval}"
           } >> "$GITHUB_OUTPUT"
 
+          {
+            echo "## 🔧 SDK Build Parameters"
+            echo ""
+            echo "- Branch: \`${CURRENT_BRANCH}\`"
+            echo "- PUBLISH: \`${INPUT_PUBLISH}\`"
+            echo "- UPDATE_VERSION: \`${INPUT_UPDATE_VERSION}\`"
+            if [ "$INPUT_UPDATE_VERSION" = "true" ]; then
+              echo "- VERSION_NAME: \`${version_name}\`"
+              echo "- VERSION_CODE: \`${version_code}\`"
+            fi
+            if [ "$INPUT_PUBLISH" = "true" ]; then
+              echo "- INTERNAL_ONLY: \`${INPUT_INTERNAL_ONLY}\`"
+              echo "- JFROG_PROJECT: \`${jfrog_project}\`"
+              if [ "$INPUT_INTERNAL_ONLY" = "true" ]; then
+                echo "- INTERNAL_VERSION_SUFFIX: \`${internal_suffix}\`"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Read current version and prepare approval summary
         id: current
         if: inputs.update_version
