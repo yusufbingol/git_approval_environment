@@ -10,8 +10,9 @@
 #
 # Required repo secrets: BITRISE_BUILD_TRIGGER_TOKEN, BITRISE_APP_SLUG
 # Required repo variable: ANDROID_PERIODIC_BUILD_ENABLED (schedule guard;
-#   scheduled runs no-op unless it is exactly 'true' — keeps Jenkins the only
-#   periodic trigger during the parallel period).
+#   scheduled runs cancel themselves (gray "cancelled" status) unless it is
+#   exactly 'true' — keeps Jenkins the only periodic trigger during the
+#   parallel period).
 # Required GitHub Environments (with required reviewers):
 #   - version-mismatch-confirmation: approval gate when a vX.Y.Z branch does
 #     not match VERSION_NAME.
@@ -36,14 +37,15 @@ on:
         required: true
         type: string
   schedule:
-    # OPEN ITEM: the Jenkins periodic cadence is configured on the Jenkins job
-    # itself (not recorded in this repo). Daily 03:00 UTC is a placeholder —
-    # align it with the actual Jenkins cron before enabling
-    # ANDROID_PERIODIC_BUILD_ENABLED.
-    - cron: '0 3 * * *'
+    # Mirrors the Jenkins timer: '0 7 * * 1-6' UTC (Mon-Sat 07:00 UTC,
+    # 10:00 TRT; no Sunday run). Guarded by ANDROID_PERIODIC_BUILD_ENABLED.
+    - cron: '0 7 * * 1-6'
 
 permissions:
   contents: read
+  # Required so a disabled scheduled run can cancel itself (gray "cancelled"
+  # status instead of a misleading green "success").
+  actions: write
 
 jobs:
   validate:
@@ -62,6 +64,7 @@ jobs:
         if: github.event_name == 'schedule'
         env:
           PERIODIC_ENABLED: ${{ vars.ANDROID_PERIODIC_BUILD_ENABLED }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "${PERIODIC_ENABLED:-}" != "true" ]; then
@@ -73,7 +76,16 @@ jobs:
               echo "During the parallel period Jenkins owns the periodic build;"
               echo "set the variable to \`true\` only after disabling the Jenkins timer."
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "Periodic build disabled (ANDROID_PERIODIC_BUILD_ENABLED != 'true'). Exiting successfully."
+            echo "::notice title=Periodic app build skipped::ANDROID_PERIODIC_BUILD_ENABLED is not 'true'. Cancelling this run so it does not show as a successful build."
+            # Cancel this run so it ends with a gray "cancelled" status instead
+            # of a misleading green "success". The sleep gives the cancellation
+            # time to take effect before the step would complete.
+            gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"
+            sleep 120
+            # Safety net: if the cancellation did not land, fail loudly rather
+            # than finish green.
+            echo "Run cancellation did not take effect within 120s." >&2
+            exit 1
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -133,6 +145,17 @@ jobs:
           echo "Computed next versions: VERSION_CODE=${next_code}, VERSION_NAME=${next_name} (from ${CURRENT_CODE} / ${CURRENT_NAME})"
           echo "version_code=${next_code}" >> "$GITHUB_OUTPUT"
           echo "version_name=${next_name}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## 🕐 Scheduled Periodic Build"
+            echo ""
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo ""
+            echo "| | VERSION_NAME | VERSION_CODE |"
+            echo "|---|---|---|"
+            echo "| Current (gradle.properties) | \`${CURRENT_NAME}\` | \`${CURRENT_CODE}\` |"
+            echo "| Next (auto-incremented) | \`${next_name}\` | \`${next_code}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Resolve and validate parameters
         id: resolve
@@ -228,6 +251,7 @@ jobs:
           CURRENT_CODE: ${{ steps.current.outputs.current_code }}
           NEW_NAME: ${{ steps.resolve.outputs.version_name }}
           NEW_CODE: ${{ steps.resolve.outputs.version_code }}
+          PERIODIC_ENABLED: ${{ vars.ANDROID_PERIODIC_BUILD_ENABLED }}
         run: |
           set -euo pipefail
 
@@ -258,10 +282,16 @@ jobs:
           # Shown to the reviewer BEFORE approval (GitHub's "Review deployments"
           # modal is not customizable, so the comparison lives here and in the
           # approve_version_update job name).
+          if [ "${PERIODIC_ENABLED:-}" = "true" ]; then
+            periodic_note="🟢 Periodic (scheduled) build is currently ENABLED (\`ANDROID_PERIODIC_BUILD_ENABLED=true\`) — the periodic schedule (Mon–Sat 07:00 UTC) will keep auto-incrementing versions from gradle.properties."
+          else
+            periodic_note="⚪ Periodic (scheduled) build is currently DISABLED (\`ANDROID_PERIODIC_BUILD_ENABLED\` is not \`true\`) — scheduled runs cancel themselves; only manual releases trigger builds."
+          fi
           {
             echo "## ⚠️ Version Update Approval Pending"
             echo ""
             echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo "- ${periodic_note}"
             echo ""
             echo "| | VERSION_NAME | VERSION_CODE |"
             echo "|---|---|---|"
